@@ -13,12 +13,13 @@ git init
 gh repo create DPDDing --public --source=. --remote=origin --push
 ```
 
-### Committing Changes
-After completing any meaningful unit of work:
-1. Stage relevant files (never use `git add -A` blindly — avoid committing secrets or large binaries)
-2. Write a clean, imperative commit message: short subject line (≤72 chars), blank line, then optional body explaining *why*
-3. Commit locally
-4. Push to GitHub immediately so there is always a remote backup
+### Committing Changes — Do This Continuously
+**Commit and push after every discrete piece of work** — after adding a file, completing a feature, fixing a bug, making a config change, or any other meaningful step. Do not batch up many changes before committing. The goal is that GitHub always reflects the current state of the project so nothing is ever lost and any point can be reverted to.
+
+Workflow for every commit:
+1. Stage specific files (never `git add -A` blindly — avoid committing secrets or large binaries)
+2. Write a clean, imperative commit message: short subject line (≤72 chars), optional body explaining *why*
+3. Push to GitHub immediately after every commit
 
 ```bash
 git add <specific-files>
