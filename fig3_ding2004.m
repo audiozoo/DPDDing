@@ -68,8 +68,10 @@ for fc_hz = [-5e6, 0, 5e6]
     raw = (randn(N,1) + 1j*randn(N,1)) / sqrt(2);
     x   = x + filter(h_lp, 1, raw) .* exp(1j*2*pi*(fc_hz/fs)*n_vec);
 end
-% Set RMS so PA operates in its nonlinear regime
-x = x * 0.3 / rms(x);
+% Set RMS so the center carrier drives the PA into its nonlinear regime.
+% H(z) has DC gain = 1.875, so rms(v_center) ≈ rms_per_carrier * 1.875.
+% Target rms(v_center) ≈ 0.45 → rms_per_carrier ≈ 0.24 → rms(x) ≈ 0.41.
+x = x * 0.41 / rms(x);
 
 %% ── PA output (no predistortion) ─────────────────────────────────────────
 y_nodpd = pa_wh(x, H_b,H_a, G_b,G_a, b1,b3,b5);
@@ -78,8 +80,9 @@ y_nodpd = pa_wh(x, H_b,H_a, G_b,G_a, b1,b3,b5);
 x_tr = x(1:N_train);
 y_tr = y_nodpd(1:N_train);
 
-% Estimate PA linear gain G (LS estimate: min ||G*x - y||^2)
-G_est = real(x_tr' * y_tr) / real(x_tr' * x_tr);
+% Estimate PA linear gain G as the RMS amplitude ratio (real positive scalar).
+% Using the full complex LS gain would rotate y/G in phase and distort the basis.
+G_est = sqrt(mean(abs(y_tr).^2) / mean(abs(x_tr).^2));
 
 % ── (b) Memoryless predistorter: K=5, Q=0 ──────────────────────────────
 % Basis from y/G per eq. (5), target = x per eq. (6)
@@ -107,18 +110,30 @@ f_c    = f_hz - fs*(f_hz >= fs/2);
 f_norm = f_c / (fs/2);
 [f_norm, sidx] = sort(f_norm);
 
-dBrel = @(P) 10*log10(P(sidx) / max(P_x));   % normalised to input peak
+% Sort PSDs to centred frequency axis
+P_x_s  = P_x(sidx);
+P_nd_s = P_nd(sidx);
+P_ml_s = P_ml(sidx);
+P_mp_s = P_mp(sidx);
+
+% Normalise EACH curve to its own in-band peak so all passbands align at 0 dB.
+% Bug fix: using a single reference (max P_x) shifted curves (a)–(c) ~9 dB high
+% relative to (d) because the PA has gain G≫1. Per-curve normalisation matches
+% the paper, where all four curves share the same passband level.
+inband = abs(f_norm) < 0.75;                   % mask covering all 3 carriers
+dBn = @(Ps) 10*log10(Ps / max(Ps(inband)));    % normalise to in-band peak
 
 %% ── Figure ───────────────────────────────────────────────────────────────
 figure('Color','w', 'Position',[100 100 680 520]);
 
-plot(f_norm, dBrel(P_nd), 'k-',  'LineWidth', 1.3); hold on;
-plot(f_norm, dBrel(P_ml), 'b--', 'LineWidth', 1.3);
-plot(f_norm, dBrel(P_mp), 'r-',  'LineWidth', 1.5);
-plot(f_norm, dBrel(P_x),  'k:',  'LineWidth', 1.0);
+% Colors chosen to be distinct on both light and dark backgrounds (no black).
+plot(f_norm, dBn(P_nd_s), 'r-',                'LineWidth', 1.4); hold on;
+plot(f_norm, dBn(P_ml_s), 'b--',               'LineWidth', 1.4);
+plot(f_norm, dBn(P_mp_s), 'Color',[0 0.6 0],   'LineStyle','-',  'LineWidth', 1.8);
+plot(f_norm, dBn(P_x_s),  'Color',[0.7 0 0.7], 'LineStyle','--', 'LineWidth', 1.2);
 
 xlim([-1 1]);
-ylim([-100 10]);
+ylim([-90 5]);
 grid on; box on;
 
 xlabel('Normalized Frequency', 'FontSize', 12);
