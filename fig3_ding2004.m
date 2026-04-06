@@ -5,148 +5,158 @@
 %   "A robust digital baseband predistorter constructed using memory polynomials,"
 %   IEEE Trans. Commun., vol. 52, no. 1, pp. 159–165, Jan. 2004.
 %
-% Figure 3: Simulated output PSD for a 3-carrier WCDMA uplink signal comparing:
-%   (1) Linear (desired) output
-%   (2) PA output without predistortion
-%   (3) PA output with memoryless DPD        (K=5, Q=0)
-%   (4) PA output with memory polynomial DPD (K=5, Q=2)
+% Figure 3 caption (from paper):
+%   "Effectiveness of predistortion in suppressing spectral regrowth when
+%    the PA is modeled by a W-H system.
+%    (a) Output without predistortion.
+%    (b) Output with memoryless predistortion.
+%    (c) Output with memory polynomial predistortion (Q=2, K=5).
+%    (d) Original input.  (c) and (d) almost coincide."
 %
-% PA model: Hammerstein — 5th-order complex polynomial nonlinearity followed
-%           by a short FIR memory filter.
-% DPD training: Indirect Learning Architecture (ILA), least-squares.
+% PA MODEL — Wiener-Hammerstein (eq. 8, 9, 10):
+%   x(n) → H(z) → v(n) → F(v) → w(n) → G(z) → y(n)
+%
+%   H(z) = (1 + 0.5 z^{-2}) / (1 - 0.2 z^{-1})          [eq. 8]
+%   G(z) = (1 - 0.1 z^{-2}) / (1 - 0.4 z^{-1})          [eq. 8]
+%
+%   F(v): w(n) = b1*v + b3*v|v|^2 + b5*v|v|^4            [eq. 9]
+%   b1 =  1.0108 + 0.0858j                               [eq. 10]
+%   b3 =  0.0879 - 0.1583j
+%   b5 = -1.0992 - 0.8891j
+%     (extracted from an actual Class AB PA)
+%
+% PREDISTORTER — memory polynomial via Indirect Learning Architecture (ILA):
+%   z(n) = sum_{k=1,3,5} sum_{q=0}^{Q} a_{kq} * x(n-q) * |x(n-q)|^{k-1}  [eq. 4]
+%   Training: â = (U^H U)^{-1} U^H z  [eq. 7]
+%   with basis u_{kq}(n) = (y(n-q)/G) * |y(n-q)/G|^{k-1}   [eq. 5]
+%
+% SIGNAL: 3-carrier WCDMA baseband, 8000 training samples (as stated in paper).
 
 clear; clc; close all;
 rng(42);
 
 %% ── Parameters ───────────────────────────────────────────────────────────
-fs          = 61.44e6;   % Sample rate (16x WCDMA chip rate 3.84 Mcps)
-chip_rate   = 3.84e6;    % WCDMA chip rate
-carrier_sep = 5e6;       % 5 MHz carrier spacing
-N           = 2^16;      % Number of samples
-K_ml        = 5;         % Polynomial order, memoryless DPD  (odd: 1,3,5)
-K_mp        = 5;         % Polynomial order, memory poly DPD
-Q_mp        = 2;         % Memory depth,    memory poly DPD
-fir_len     = 127;       % Carrier-shaping FIR length
+fs        = 20e6;     % Sample rate — places 3 WCDMA carriers at ±0.5 norm. freq.
+N         = 2^16;     % Total samples (for smooth PSD estimate)
+N_train   = 8000;     % Training samples, as specified in paper Section V
+K         = 5;        % Polynomial order (odd terms: 1, 3, 5)
+Q_memless = 0;        % Memory depth — memoryless predistorter
+Q_memory  = 2;        % Memory depth — memory polynomial predistorter
+chip_rate = 3.84e6;   % WCDMA chip rate
 
-%% ── PA model coefficients ────────────────────────────────────────────────
-% 5th-order complex polynomial + 3-tap FIR memory
-c1   =  1.00 + 0.00j;
-c3   = -0.20 - 0.15j;
-c5   =  0.05 + 0.04j;
-h_pa = [1.0,  0.15-0.10j,  0.05+0.05j];
+%% ── Exact W-H PA model (eqs 8–10) ───────────────────────────────────────
+% H(z) = (1 + 0.5 z^{-2}) / (1 - 0.2 z^{-1})
+H_b = [1, 0, 0.5];   H_a = [1, -0.2];
+
+% G(z) = (1 - 0.1 z^{-2}) / (1 - 0.4 z^{-1})
+G_b = [1, 0, -0.1];  G_a = [1, -0.4];
+
+% Memoryless nonlinearity F(v) coefficients
+b1 =  1.0108 + 0.0858j;
+b3 =  0.0879 - 0.1583j;
+b5 = -1.0992 - 0.8891j;
 
 %% ── Generate 3-carrier WCDMA-like baseband signal ────────────────────────
-% Each carrier: LPF-filtered complex Gaussian noise modulated to ±5 MHz, 0 Hz.
-bw_norm = (chip_rate * 1.25) / (fs/2);  % per-carrier BW normalised to Nyquist
-h_lp    = fir1(fir_len-1, bw_norm/2);  % single-carrier lowpass shaping filter
+% Carriers at -5 MHz, 0 Hz, +5 MHz (5 MHz WCDMA spacing).
+% Each: LPF-shaped complex Gaussian noise (statistically equivalent to
+% filtered QPSK at chip_rate = 3.84 Mcps).
+bw_norm = chip_rate / (fs/2);        % Per-carrier BW normalised to Nyquist
+h_lp    = fir1(127, bw_norm/2);      % Single-carrier shaping lowpass filter
 n_vec   = (0:N-1).';
-x = zeros(N,1);
-for fc = [-carrier_sep, 0, carrier_sep]
-    raw   = (randn(N,1) + 1j*randn(N,1)) / sqrt(2);
-    lp    = filter(h_lp, 1, raw);
-    x     = x + lp .* exp(1j*2*pi*(fc/fs)*n_vec);
+x = zeros(N, 1);
+for fc_hz = [-5e6, 0, 5e6]
+    raw = (randn(N,1) + 1j*randn(N,1)) / sqrt(2);
+    x   = x + filter(h_lp, 1, raw) .* exp(1j*2*pi*(fc_hz/fs)*n_vec);
 end
-x = x / (0.95 * max(abs(x)));   % peak normalise
+% Set RMS so PA operates in its nonlinear regime
+x = x * 0.3 / rms(x);
 
-%% ── PA output without DPD ────────────────────────────────────────────────
-y_no_dpd = pa_model(x, c1, c3, c5, h_pa);
+%% ── PA output (no predistortion) ─────────────────────────────────────────
+y_nodpd = pa_wh(x, H_b,H_a, G_b,G_a, b1,b3,b5);
 
-%% ── ILA: train postdistorter, use copy as predistorter ───────────────────
-% Estimate PA linear gain for target scaling
-gain  = (x' * y_no_dpd) / (x' * x);
-x_tgt = x * gain;
+%% ── ILA predistorter training on first N_train samples ───────────────────
+x_tr = x(1:N_train);
+y_tr = y_nodpd(1:N_train);
 
-% ── Memoryless DPD (K=5, Q=0) ──────────────────────────────────────────
-Phi_ml   = mp_basis(y_no_dpd, K_ml, 0);
-a_ml     = (Phi_ml' * Phi_ml) \ (Phi_ml' * x_tgt);
-y_ml     = pa_model(mp_basis(x, K_ml, 0) * a_ml, c1, c3, c5, h_pa);
+% Estimate PA linear gain G (LS estimate: min ||G*x - y||^2)
+G_est = real(x_tr' * y_tr) / real(x_tr' * x_tr);
 
-% ── Memory polynomial DPD (K=5, Q=2) ───────────────────────────────────
-Phi_mp   = mp_basis(y_no_dpd, K_mp, Q_mp);
-a_mp     = (Phi_mp' * Phi_mp) \ (Phi_mp' * x_tgt);
-y_mp     = pa_model(mp_basis(x, K_mp, Q_mp) * a_mp, c1, c3, c5, h_pa);
+% ── (b) Memoryless predistorter: K=5, Q=0 ──────────────────────────────
+% Basis from y/G per eq. (5), target = x per eq. (6)
+U_ml = mp_basis(y_tr/G_est, K, Q_memless);
+a_ml = (U_ml' * U_ml) \ (U_ml' * x_tr);
+y_ml = pa_wh(mp_basis(x, K, Q_memless)*a_ml, H_b,H_a, G_b,G_a, b1,b3,b5);
 
-%% ── PSD via Welch ─────────────────────────────────────────────────────────
+% ── (c) Memory polynomial predistorter: K=5, Q=2 ───────────────────────
+U_mp = mp_basis(y_tr/G_est, K, Q_memory);
+a_mp = (U_mp' * U_mp) \ (U_mp' * x_tr);
+y_mp = pa_wh(mp_basis(x, K, Q_memory)*a_mp, H_b,H_a, G_b,G_a, b1,b3,b5);
+
+%% ── Power spectral density (Welch) ───────────────────────────────────────
 nfft     = 4096;
 win      = hann(nfft);
 noverlap = nfft/2;
 
-[P_lin,   f_hz] = pwelch(x,        win, noverlap, nfft, fs, 'twosided');
-[P_noDPD, ~   ] = pwelch(y_no_dpd, win, noverlap, nfft, fs, 'twosided');
-[P_ml,    ~   ] = pwelch(y_ml,     win, noverlap, nfft, fs, 'twosided');
-[P_mp,    ~   ] = pwelch(y_mp,     win, noverlap, nfft, fs, 'twosided');
+[P_x,  f_hz] = pwelch(x,       win, noverlap, nfft, fs, 'twosided');
+[P_nd, ~    ] = pwelch(y_nodpd, win, noverlap, nfft, fs, 'twosided');
+[P_ml, ~    ] = pwelch(y_ml,    win, noverlap, nfft, fs, 'twosided');
+[P_mp, ~    ] = pwelch(y_mp,    win, noverlap, nfft, fs, 'twosided');
 
-% Shift to centred axis: -fs/2 … +fs/2
-f_shift = f_hz - fs*(f_hz >= fs/2);
-[f_MHz, sort_idx] = sort(f_shift / 1e6);
+% Shift to centred axis and normalise to ±1 (paper x-axis convention)
+f_c    = f_hz - fs*(f_hz >= fs/2);
+f_norm = f_c / (fs/2);
+[f_norm, sidx] = sort(f_norm);
 
-P = @(raw) raw(sort_idx);            % reorder any PSD vector
-ref_lin = max(P(P_lin));             % reference power for 0 dB top
-dBrel   = @(raw) 10*log10(P(raw) / ref_lin);
+dBrel = @(P) 10*log10(P(sidx) / max(P_x));   % normalised to input peak
 
-%% ── Plot ─────────────────────────────────────────────────────────────────
-figure('Color','w', 'Position',[100 100 720 500]);
+%% ── Figure ───────────────────────────────────────────────────────────────
+figure('Color','w', 'Position',[100 100 680 520]);
 
-plot(f_MHz, dBrel(P_lin),   'k-',  'LineWidth', 1.3); hold on;
-plot(f_MHz, dBrel(P_noDPD), 'r--', 'LineWidth', 1.3);
-plot(f_MHz, dBrel(P_ml),    'b-.', 'LineWidth', 1.3);
-plot(f_MHz, dBrel(P_mp),    'g-',  'LineWidth', 1.6);
+plot(f_norm, dBrel(P_nd), 'k-',  'LineWidth', 1.3); hold on;
+plot(f_norm, dBrel(P_ml), 'b--', 'LineWidth', 1.3);
+plot(f_norm, dBrel(P_mp), 'r-',  'LineWidth', 1.5);
+plot(f_norm, dBrel(P_x),  'k:',  'LineWidth', 1.0);
 
-xlim([-25 25]);  ylim([-80 5]);
-grid on;  box on;
-xlabel('Frequency (MHz)',       'FontSize', 12);
-ylabel('Normalised PSD (dB)',   'FontSize', 12);
-title({'Simulated PA Output PSD — 3-Carrier WCDMA Signal'; ...
-       'Ding et al. 2004, Fig. 3'},  'FontSize', 12);
-legend({'Linear (desired)', ...
-        'No predistortion', ...
-        'Memoryless DPD (K=5, Q=0)', ...
-        'Memory poly. DPD (K=5, Q=2)'}, ...
-       'Location','south', 'FontSize', 10);
+xlim([-1 1]);
+ylim([-100 10]);
+grid on; box on;
 
-for fc = [-10 -5 0 5 10]
-    xline(fc, ':', 'Color', [0.7 0.7 0.7]);   % carrier centre markers
-end
+xlabel('Normalized Frequency', 'FontSize', 12);
+ylabel('PSD (dB)',              'FontSize', 12);
+title({'Effectiveness of predistortion in suppressing spectral regrowth'; ...
+       '(W–H PA model)  —  Ding et al. 2004, Fig. 3'}, 'FontSize', 11);
 
-%% ── ACPR report ──────────────────────────────────────────────────────────
-% Average adjacent-channel power relative to total in-band power
-acpr = @(P_s, P_d) calc_acpr(f_MHz, P(P_s), P(P_d));
-fprintf('\n--- ACPR (adjacent channels ±10–20 MHz) ---\n');
-fprintf('  No DPD           : %+.1f dBc\n', acpr(P_lin, P_noDPD));
-fprintf('  Memoryless DPD   : %+.1f dBc\n', acpr(P_lin, P_ml));
-fprintf('  Memory poly. DPD : %+.1f dBc\n', acpr(P_lin, P_mp));
+legend({'(a) No predistortion', ...
+        '(b) Memoryless predistortion', ...
+        '(c) Memory poly. predistortion (Q=2, K=5)', ...
+        '(d) Original input'}, ...
+       'Location', 'south', 'FontSize', 10);
 
 % =========================================================================
-%  LOCAL FUNCTIONS  (must appear after all script body code)
+%  LOCAL FUNCTIONS  (all local functions must appear after script body)
 % =========================================================================
 
-function y = pa_model(u, c1, c3, c5, h_pa)
-% Hammerstein PA: static 5th-order polynomial then FIR memory filter.
-    nl = c1*u + c3*u.*abs(u).^2 + c5*u.*abs(u).^4;
-    y  = filter(h_pa, 1, nl);
+function y = pa_wh(u, H_b,H_a, G_b,G_a, b1,b3,b5)
+% Wiener-Hammerstein PA model (Fig. 2 / eq. 8-10 of Ding 2004):
+%   u → H(z) → v → F(v) → w → G(z) → y
+    v = filter(H_b, H_a, u);
+    w = b1*v + b3*v.*abs(v).^2 + b5*v.*abs(v).^4;
+    y = filter(G_b, G_a, w);
 end
 
 function Phi = mp_basis(u, K, Q)
-% Build the memory-polynomial basis matrix for signal u.
-% Columns: odd orders k=1,3,...,K crossed with delays q=0,...,Q.
-    N_u    = length(u);
-    odd_k  = 1:2:K;
-    Phi    = zeros(N_u, numel(odd_k)*(Q+1), 'like', 1j);
-    col = 1;
+% Memory-polynomial basis matrix (eq. 4-5 of Ding 2004).
+% Columns: odd orders k=1,3,...,K  ×  delays q=0,...,Q.
+% Row n:   [u(n)|u(n)|^0, u(n-1)|u(n-1)|^0, ..., u(n)|u(n)|^4, ...]
+    N_u   = length(u);
+    odd_k = 1:2:K;
+    Phi   = zeros(N_u, numel(odd_k)*(Q+1), 'like', 1j);
+    col   = 1;
     for k = odd_k
         for q = 0:Q
-            ud          = [zeros(q,1,'like',u); u(1:N_u-q)];
-            Phi(:, col) = ud .* abs(ud).^(k-1);
-            col         = col + 1;
+            ud         = [zeros(q,1,'like',u); u(1:N_u-q)];
+            Phi(:,col) = ud .* abs(ud).^(k-1);
+            col        = col + 1;
         end
     end
-end
-
-function acpr_dBc = calc_acpr(f_MHz, P_sig, P_dist)
-% ACPR: mean distorted power in adjacent channels vs mean signal power in-band.
-% In-band: |f| < 9 MHz (covers all 3 WCDMA carriers at ±5 MHz).
-% Adjacent: 10 MHz < |f| < 20 MHz.
-    inband = abs(f_MHz) < 9;
-    adj    = abs(f_MHz) >= 10 & abs(f_MHz) <= 20;
-    acpr_dBc = 10*log10(mean(P_dist(adj)) / mean(P_sig(inband)));
 end
