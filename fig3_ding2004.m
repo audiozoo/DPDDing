@@ -48,13 +48,6 @@ chip_rate = 3.84e6;  % WCDMA chip rate
 K         = 5;       % Max polynomial order (odd terms: 1, 3, 5)   — paper Sec. V
 Q_ml      = 0;       % Memory depth: memoryless predistorter
 Q_mp      = 2;       % Memory depth: memory polynomial — stated in paper Sec. V / Fig. 3
-N_iter    = 5;       % ILA iterations (see note below)
-
-% Note on N_iter: The paper describes a one-pass ILA conceptually, but in
-% practice the indirect-learning solution is only exact at convergence.
-% Iterating — each pass uses the *current* predistorter output as the new
-% PA stimulus, so the basis U tracks the actual operating point — removes
-% the in-band distortion that a single pass produces.
 
 %% ── W-H PA model: exact coefficients from paper ──────────────────────────
 
@@ -97,10 +90,10 @@ y_nodpd = pa(x);
 x_tr = x(1:N_train);
 
 % (b) Memoryless predistorter: K=5, Q=0 [paper: "memoryless predistortion"]
-a_ml = ila_train(x_tr, pa, K, Q_ml, N_iter);
+a_ml = ila_train(x_tr, pa, K, Q_ml);
 
 % (c) Memory polynomial predistorter: K=5, Q=2 [paper Fig. 3 caption]
-a_mp = ila_train(x_tr, pa, K, Q_mp, N_iter);
+a_mp = ila_train(x_tr, pa, K, Q_mp);
 
 %% ── PA outputs with DPD applied to full signal ───────────────────────────
 % Predistorter output: eq. (4)  z(n) = Σ a_{kq} x(n-q)|x(n-q)|^{k-1}
@@ -163,50 +156,36 @@ legend({'(a) No predistortion', ...
 %  LOCAL FUNCTIONS  — must appear after all script body code in MATLAB
 % =========================================================================
 
-function a = ila_train(x_tr, pa_fn, K, Q, N_iter)
+function a = ila_train(x_tr, pa_fn, K, Q)
 % ILA_TRAIN  Identify memory-polynomial predistorter via Indirect Learning.
 %
-% Implements the iterative ILA (paper Sec. III, Fig. 1):
-%   • Training block A has y(n)/G as input, ẑ(n) as output.
-%   • Predistorter is an exact copy of A with x(n) as input.
-%   • At convergence: ẑ(n) = z(n), which renders y(n) = G·x(n).
+% Implements the single-pass ILA (paper Sec. III, Fig. 1):
+%   • Training block A has y(n)/G as input, x(n) as desired output.
+%   • Predistorter is an exact copy of block A applied to x(n).
 %
-% Each iteration:
-%   1. z  = current predistorter output on training data  [initialised to x]
-%   2. y  = PA(z)                                        [PA response to z]
-%   3. G  = sqrt( E[|y|²] / E[|z|²] )                   [gain, below Fig. 1]
-%   4. U  = mp_basis(y/G, K, Q)                          [eq. (5)]
-%   5. â  = (UᴴU + λI)⁻¹ Uᴴ z                          [eq. (7) + Tikhonov]
-%   6. z  = mp_basis(x_tr, K, Q) · â                    [updated z via eq.(4)]
-%
-% After N_iter passes the coefficients â describe the predistorter eq. (4).
+% Steps:
+%   1. y  = PA(x_tr)                      [PA response to training input]
+%   2. G  = sqrt( E[|y|²] / E[|x|²] )    [gain estimate, below Fig. 1]
+%   3. U  = mp_basis(y/G, K, Q)           [postdistorter basis — eq. (5)]
+%   4. â  = (UᴴU + λI)⁻¹ Uᴴ x_tr        [least-squares — eq. (7)]
 
-    n_c = numel(1:2:K) * (Q + 1);   % number of basis functions
-    z   = x_tr;                      % Step 1 init: identity predistorter
+    n_c = numel(1:2:K) * (Q + 1);
 
-    for iter = 1:N_iter
+    % Step 1 — PA response to the training input
+    y = pa_fn(x_tr);
 
-        % Step 2 — PA response to current predistorter output
-        y_z = pa_fn(z);
+    % Step 2 — Gain estimate [below Fig. 1]
+    G = sqrt(mean(abs(y).^2) / mean(abs(x_tr).^2));
 
-        % Step 3 — Estimate PA gain G as RMS amplitude ratio [below Fig. 1]
-        G = sqrt(mean(abs(y_z).^2) / mean(abs(z).^2));
+    % Step 3 — Postdistorter basis from scaled PA output — eq. (5)
+    %   u_{kq}(n) = [y(n-q)/G] · |y(n-q)/G|^{k-1}
+    U = mp_basis(y / G, K, Q);
 
-        % Step 4 — Build basis matrix from scaled PA output — eq. (5)
-        %   u_{kq}(n) = [y(n-q)/G] · |y(n-q)/G|^{k-1}
-        U = mp_basis(y_z / G, K, Q);
-
-        % Step 5 — Least-squares identification — eq. (7)
-        %   â = (UᴴU)⁻¹ Uᴴ z
-        %   Tikhonov regularisation (λ·I) added for numerical stability.
-        lambda = 1e-4 * mean(diag(real(U' * U)));
-        a = (U' * U + lambda * eye(n_c)) \ (U' * z);
-
-        % Step 6 — Update predistorter output for next iteration — eq. (4)
-        %   z(n) = Σ_{k,q} a_{kq} · x(n-q)|x(n-q)|^{k-1}
-        z = mp_basis(x_tr, K, Q) * a;
-
-    end
+    % Step 4 — Least-squares solution — eq. (7)
+    %   â = (UᴴU)⁻¹ Uᴴ x_tr
+    %   Tikhonov regularisation (λ·I) for numerical stability.
+    lambda = 1e-4 * mean(diag(real(U' * U)));
+    a = (U' * U + lambda * eye(n_c)) \ (U' * x_tr);
 end
 
 % ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
