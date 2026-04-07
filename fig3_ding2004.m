@@ -5,139 +5,151 @@
 %   "A robust digital baseband predistorter constructed using memory polynomials,"
 %   IEEE Trans. Commun., vol. 52, no. 1, pp. 159–165, Jan. 2004.
 %
-% Figure 3 caption (from paper):
-%   "Effectiveness of predistortion in suppressing spectral regrowth when
-%    the PA is modeled by a W-H system.
-%    (a) Output without predistortion.
+% Figure 3 caption (verbatim):
+%   "Effectiveness of predistortion in suppressing spectral regrowth when the PA
+%    is modelled by a W-H system. (a) Output without predistortion.
 %    (b) Output with memoryless predistortion.
 %    (c) Output with memory polynomial predistortion (Q=2, K=5).
 %    (d) Original input.  (c) and (d) almost coincide."
 %
-% PA MODEL — Wiener-Hammerstein (eq. 8, 9, 10):
-%   x(n) → H(z) → v(n) → F(v) → w(n) → G(z) → y(n)
+% ── Paper equations implemented ──────────────────────────────────────────
+%  Eq. (4)  Memory polynomial predistorter output:
+%             z(n) = Σ_{k=1,3,5} Σ_{q=0}^{Q}  a_{kq} x(n-q)|x(n-q)|^{k-1}
 %
-%   H(z) = (1 + 0.5 z^{-2}) / (1 - 0.2 z^{-1})          [eq. 8]
-%   G(z) = (1 - 0.1 z^{-2}) / (1 - 0.4 z^{-1})          [eq. 8]
+%  Eq. (5)  Basis function for ILA training block A:
+%             u_{kq}(n) = [y(n-q)/G] · |y(n-q)/G|^{k-1}
 %
-%   F(v): w(n) = b1*v + b3*v|v|^2 + b5*v|v|^4            [eq. 9]
-%   b1 =  1.0108 + 0.0858j                               [eq. 10]
-%   b3 =  0.0879 - 0.1583j
-%   b5 = -1.0992 - 0.8891j
-%     (extracted from an actual Class AB PA)
+%  Eq. (6)  Matrix form:  z = U a
+%             z  = [z(0),…,z(N-1)]^T   (current predistorter output on training data)
+%             U  = [u_{10},…,u_{KQ}]   (N × n_coeff basis matrix)
 %
-% PREDISTORTER — memory polynomial via Indirect Learning Architecture (ILA):
-%   z(n) = sum_{k=1,3,5} sum_{q=0}^{Q} a_{kq} * x(n-q) * |x(n-q)|^{k-1}  [eq. 4]
-%   Training: â = (U^H U)^{-1} U^H z  [eq. 7]
-%   with basis u_{kq}(n) = (y(n-q)/G) * |y(n-q)/G|^{k-1}   [eq. 5]
+%  Eq. (7)  Least-squares solution:  â = (U^H U)^{-1} U^H z
 %
-% SIGNAL: 3-carrier WCDMA baseband, 8000 training samples (as stated in paper).
+%  Eq. (8)  W-H LTI blocks:
+%             H(z) = (1 + 0.5 z^{-2}) / (1 − 0.2 z^{-1})
+%             G(z) = (1 − 0.1 z^{-2}) / (1 − 0.4 z^{-1})
+%
+%  Eq. (9)  Memoryless nonlinearity:
+%             w(n) = Σ_{k=1,3,5} b_k v(n)|v(n)|^{k-1}
+%
+%  Eq. (10) Nonlinearity coefficients (extracted from a Class-AB PA):
+%             b1 = 1.0108 + 0.0858j
+%             b3 = 0.0879 − 0.1583j
+%             b5 = −1.0992 − 0.8891j
 
 clear; clc; close all;
 rng(42);
 
-%% ── Parameters ───────────────────────────────────────────────────────────
-fs        = 20e6;     % Sample rate — places 3 WCDMA carriers at ±0.5 norm. freq.
-N         = 2^16;     % Total samples (for smooth PSD estimate)
-N_train   = 8000;     % Training samples, as specified in paper Section V
-K         = 5;        % Polynomial order (odd terms: 1, 3, 5)
-Q_memless = 0;        % Memory depth — memoryless predistorter
-Q_memory  = 2;        % Memory depth — memory polynomial predistorter
-chip_rate = 3.84e6;   % WCDMA chip rate
+%% ── Simulation parameters ────────────────────────────────────────────────
+fs        = 20e6;    % Sample rate: places 3 WCDMA carriers at ±0.5 normalised freq
+N         = 2^16;    % Total samples used for PSD estimation
+N_train   = 8000;    % Training samples — stated in paper Section V
+chip_rate = 3.84e6;  % WCDMA chip rate
+K         = 5;       % Max polynomial order (odd terms: 1, 3, 5)   — paper Sec. V
+Q_ml      = 0;       % Memory depth: memoryless predistorter
+Q_mp      = 2;       % Memory depth: memory polynomial — stated in paper Sec. V / Fig. 3
+N_iter    = 5;       % ILA iterations (see note below)
 
-%% ── Exact W-H PA model (eqs 8–10) ───────────────────────────────────────
-% H(z) = (1 + 0.5 z^{-2}) / (1 - 0.2 z^{-1})
-H_b = [1, 0, 0.5];   H_a = [1, -0.2];
+% Note on N_iter: The paper describes a one-pass ILA conceptually, but in
+% practice the indirect-learning solution is only exact at convergence.
+% Iterating — each pass uses the *current* predistorter output as the new
+% PA stimulus, so the basis U tracks the actual operating point — removes
+% the in-band distortion that a single pass produces.
 
-% G(z) = (1 - 0.1 z^{-2}) / (1 - 0.4 z^{-1})
-G_b = [1, 0, -0.1];  G_a = [1, -0.4];
+%% ── W-H PA model: exact coefficients from paper ──────────────────────────
 
-% Memoryless nonlinearity F(v) coefficients
+% LTI blocks — eq. (8)
+H_b = [1, 0, 0.5];   H_a = [1, -0.2];    % H(z) = (1+0.5z^{-2})/(1−0.2z^{-1})
+G_b = [1, 0, -0.1];  G_a = [1, -0.4];    % G(z) = (1−0.1z^{-2})/(1−0.4z^{-1})
+
+% Memoryless nonlinearity coefficients — eq. (10)
 b1 =  1.0108 + 0.0858j;
 b3 =  0.0879 - 0.1583j;
 b5 = -1.0992 - 0.8891j;
 
+% Convenience handle so PA parameters need not be re-listed everywhere
+pa = @(u) pa_wh(u, H_b, H_a, G_b, G_a, b1, b3, b5);
+
 %% ── Generate 3-carrier WCDMA-like baseband signal ────────────────────────
-% Carriers at -5 MHz, 0 Hz, +5 MHz (5 MHz WCDMA spacing).
-% Each: LPF-shaped complex Gaussian noise (statistically equivalent to
-% filtered QPSK at chip_rate = 3.84 Mcps).
-bw_norm = chip_rate / (fs/2);        % Per-carrier BW normalised to Nyquist
-h_lp    = fir1(127, bw_norm/2);      % Single-carrier shaping lowpass filter
+% Three carriers at −5 MHz, 0 Hz, +5 MHz (standard 5 MHz WCDMA spacing).
+% Each carrier: LPF-shaped complex Gaussian noise — same spectral statistics
+% as a root-raised-cosine filtered QPSK stream at chip_rate = 3.84 Mcps.
+
+bw_norm = chip_rate / (fs/2);        % per-carrier bandwidth, normalised to Nyquist
+h_lp    = fir1(127, bw_norm/2);      % carrier-shaping lowpass FIR
 n_vec   = (0:N-1).';
 x = zeros(N, 1);
 for fc_hz = [-5e6, 0, 5e6]
     raw = (randn(N,1) + 1j*randn(N,1)) / sqrt(2);
     x   = x + filter(h_lp, 1, raw) .* exp(1j*2*pi*(fc_hz/fs)*n_vec);
 end
-% Set RMS so the center carrier drives the PA into its nonlinear regime.
-% H(z) has DC gain = 1.875, so rms(v_center) ≈ rms_per_carrier * 1.875.
-% Target rms(v_center) ≈ 0.45 → rms_per_carrier ≈ 0.24 → rms(x) ≈ 0.41.
-x = x * 0.41 / rms(x);
 
-%% ── PA output (no predistortion) ─────────────────────────────────────────
-y_nodpd = pa_wh(x, H_b,H_a, G_b,G_a, b1,b3,b5);
+% Set drive level so the PA operates in its nonlinear regime.
+% H(z) DC gain = 1.875 amplifies the centre carrier; targeting rms(v_centre)
+% near the polynomial's 1-dB compression point (~|v|=0.6).
+x = x * 0.3 / rms(x);
 
-%% ── ILA predistorter training on first N_train samples ───────────────────
+%% ── (a) PA output with no predistortion ──────────────────────────────────
+y_nodpd = pa(x);
+
+%% ── Predistorter training via iterative ILA (paper Sec. III–IV) ──────────
+% Extract training block (8000 samples as stated in paper Section V)
 x_tr = x(1:N_train);
-y_tr = y_nodpd(1:N_train);
 
-% Estimate PA linear gain G as the RMS amplitude ratio (real positive scalar).
-% Using the full complex LS gain would rotate y/G in phase and distort the basis.
-G_est = sqrt(mean(abs(y_tr).^2) / mean(abs(x_tr).^2));
+% (b) Memoryless predistorter: K=5, Q=0 [paper: "memoryless predistortion"]
+a_ml = ila_train(x_tr, pa, K, Q_ml, N_iter);
 
-% ── (b) Memoryless predistorter: K=5, Q=0 ──────────────────────────────
-% Basis from y/G per eq. (5), target = x per eq. (6)
-U_ml = mp_basis(y_tr/G_est, K, Q_memless);
-a_ml = (U_ml' * U_ml) \ (U_ml' * x_tr);
-y_ml = pa_wh(mp_basis(x, K, Q_memless)*a_ml, H_b,H_a, G_b,G_a, b1,b3,b5);
+% (c) Memory polynomial predistorter: K=5, Q=2 [paper Fig. 3 caption]
+a_mp = ila_train(x_tr, pa, K, Q_mp, N_iter);
 
-% ── (c) Memory polynomial predistorter: K=5, Q=2 ───────────────────────
-U_mp = mp_basis(y_tr/G_est, K, Q_memory);
-a_mp = (U_mp' * U_mp) \ (U_mp' * x_tr);
-y_mp = pa_wh(mp_basis(x, K, Q_memory)*a_mp, H_b,H_a, G_b,G_a, b1,b3,b5);
+%% ── PA outputs with DPD applied to full signal ───────────────────────────
+% Predistorter output: eq. (4)  z(n) = Σ a_{kq} x(n-q)|x(n-q)|^{k-1}
+y_ml = pa(mp_basis(x, K, Q_ml) * a_ml);   % (b) memoryless DPD
+y_mp = pa(mp_basis(x, K, Q_mp) * a_mp);   % (c) memory poly DPD
 
 %% ── Power spectral density (Welch) ───────────────────────────────────────
 nfft     = 4096;
 win      = hann(nfft);
-noverlap = nfft/2;
+noverlap = nfft / 2;
 
 [P_x,  f_hz] = pwelch(x,       win, noverlap, nfft, fs, 'twosided');
 [P_nd, ~    ] = pwelch(y_nodpd, win, noverlap, nfft, fs, 'twosided');
 [P_ml, ~    ] = pwelch(y_ml,    win, noverlap, nfft, fs, 'twosided');
 [P_mp, ~    ] = pwelch(y_mp,    win, noverlap, nfft, fs, 'twosided');
 
-% Shift to centred axis and normalise to ±1 (paper x-axis convention)
-f_c    = f_hz - fs*(f_hz >= fs/2);
+% Shift to centred axis; normalise to ±1 (paper x-axis convention)
+f_c    = f_hz - fs * (f_hz >= fs/2);
 f_norm = f_c / (fs/2);
 [f_norm, sidx] = sort(f_norm);
 
-% Sort PSDs to centred frequency axis
+% Sort all PSDs to the centred axis
 P_x_s  = P_x(sidx);
 P_nd_s = P_nd(sidx);
 P_ml_s = P_ml(sidx);
 P_mp_s = P_mp(sidx);
 
-% Normalise EACH curve to its own in-band peak so all passbands align at 0 dB.
-% Bug fix: using a single reference (max P_x) shifted curves (a)–(c) ~9 dB high
-% relative to (d) because the PA has gain G≫1. Per-curve normalisation matches
-% the paper, where all four curves share the same passband level.
-inband = abs(f_norm) < 0.75;                   % mask covering all 3 carriers
-dBn = @(Ps) 10*log10(Ps / max(Ps(inband)));    % normalise to in-band peak
+% Normalise each curve to its own in-band peak so all four passbands
+% align at 0 dB — matches the paper where all curves share the same
+% passband level. The PA has gain G≠1, so a single shared reference would
+% offset the input curve (d) vs the PA output curves (a)–(c).
+inband = abs(f_norm) < 0.75;                    % mask covering all 3 carriers
+dBn    = @(Ps) 10*log10(Ps / max(Ps(inband)));  % normalise to in-band peak
 
 %% ── Figure ───────────────────────────────────────────────────────────────
-figure('Color','w', 'Position',[100 100 680 520]);
+figure('Color', 'w', 'Position', [100 100 680 520]);
 
-% Colors chosen to be distinct on both light and dark backgrounds (no black).
+% Plot order matches paper caption: (a) worst → (d) reference
 plot(f_norm, dBn(P_nd_s), 'r-',                'LineWidth', 1.4); hold on;
 plot(f_norm, dBn(P_ml_s), 'b--',               'LineWidth', 1.4);
-plot(f_norm, dBn(P_mp_s), 'Color',[0 0.6 0],   'LineStyle','-',  'LineWidth', 1.8);
-plot(f_norm, dBn(P_x_s),  'Color',[0.7 0 0.7], 'LineStyle','--', 'LineWidth', 1.2);
+plot(f_norm, dBn(P_mp_s), 'Color',[0 0.55 0],  'LineStyle','-',  'LineWidth', 2.0);
+plot(f_norm, dBn(P_x_s),  'Color',[0.6 0 0.7], 'LineStyle','--', 'LineWidth', 1.2);
 
 xlim([-1 1]);
 ylim([-90 5]);
 grid on; box on;
 
-xlabel('Normalized Frequency', 'FontSize', 12);
-ylabel('PSD (dB)',              'FontSize', 12);
+xlabel('Normalized Frequency',  'FontSize', 12);
+ylabel('PSD (dB)',               'FontSize', 12);
 title({'Effectiveness of predistortion in suppressing spectral regrowth'; ...
        '(W–H PA model)  —  Ding et al. 2004, Fig. 3'}, 'FontSize', 11);
 
@@ -148,29 +160,92 @@ legend({'(a) No predistortion', ...
        'Location', 'south', 'FontSize', 10);
 
 % =========================================================================
-%  LOCAL FUNCTIONS  (all local functions must appear after script body)
+%  LOCAL FUNCTIONS  — must appear after all script body code in MATLAB
 % =========================================================================
 
-function y = pa_wh(u, H_b,H_a, G_b,G_a, b1,b3,b5)
-% Wiener-Hammerstein PA model (Fig. 2 / eq. 8-10 of Ding 2004):
-%   u → H(z) → v → F(v) → w → G(z) → y
-    v = filter(H_b, H_a, u);
-    w = b1*v + b3*v.*abs(v).^2 + b5*v.*abs(v).^4;
-    y = filter(G_b, G_a, w);
+function a = ila_train(x_tr, pa_fn, K, Q, N_iter)
+% ILA_TRAIN  Identify memory-polynomial predistorter via Indirect Learning.
+%
+% Implements the iterative ILA (paper Sec. III, Fig. 1):
+%   • Training block A has y(n)/G as input, ẑ(n) as output.
+%   • Predistorter is an exact copy of A with x(n) as input.
+%   • At convergence: ẑ(n) = z(n), which renders y(n) = G·x(n).
+%
+% Each iteration:
+%   1. z  = current predistorter output on training data  [initialised to x]
+%   2. y  = PA(z)                                        [PA response to z]
+%   3. G  = sqrt( E[|y|²] / E[|z|²] )                   [gain, below Fig. 1]
+%   4. U  = mp_basis(y/G, K, Q)                          [eq. (5)]
+%   5. â  = (UᴴU + λI)⁻¹ Uᴴ z                          [eq. (7) + Tikhonov]
+%   6. z  = mp_basis(x_tr, K, Q) · â                    [updated z via eq.(4)]
+%
+% After N_iter passes the coefficients â describe the predistorter eq. (4).
+
+    n_c = numel(1:2:K) * (Q + 1);   % number of basis functions
+    z   = x_tr;                      % Step 1 init: identity predistorter
+
+    for iter = 1:N_iter
+
+        % Step 2 — PA response to current predistorter output
+        y_z = pa_fn(z);
+
+        % Step 3 — Estimate PA gain G as RMS amplitude ratio [below Fig. 1]
+        G = sqrt(mean(abs(y_z).^2) / mean(abs(z).^2));
+
+        % Step 4 — Build basis matrix from scaled PA output — eq. (5)
+        %   u_{kq}(n) = [y(n-q)/G] · |y(n-q)/G|^{k-1}
+        U = mp_basis(y_z / G, K, Q);
+
+        % Step 5 — Least-squares identification — eq. (7)
+        %   â = (UᴴU)⁻¹ Uᴴ z
+        %   Tikhonov regularisation (λ·I) added for numerical stability.
+        lambda = 1e-4 * mean(diag(real(U' * U)));
+        a = (U' * U + lambda * eye(n_c)) \ (U' * z);
+
+        % Step 6 — Update predistorter output for next iteration — eq. (4)
+        %   z(n) = Σ_{k,q} a_{kq} · x(n-q)|x(n-q)|^{k-1}
+        z = mp_basis(x_tr, K, Q) * a;
+
+    end
 end
 
+% ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
+function y = pa_wh(u, H_b, H_a, G_b, G_a, b1, b3, b5)
+% PA_WH  Wiener-Hammerstein power amplifier model (paper Fig. 2).
+%
+%   u(n) → H(z) → v(n) → F(v) → w(n) → G(z) → y(n)
+%
+%   H(z), G(z) : LTI filters,        eq. (8)
+%   F(v)       : memoryless NL,       eq. (9)
+%   b1,b3,b5   : NL coefficients,     eq. (10)
+
+    v = filter(H_b, H_a, u);                          % H(z)  — eq. (8)
+    w = b1*v + b3*v.*abs(v).^2 + b5*v.*abs(v).^4;    % F(v)  — eq. (9)
+    y = filter(G_b, G_a, w);                          % G(z)  — eq. (8)
+end
+
+% ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ── ──
+
 function Phi = mp_basis(u, K, Q)
-% Memory-polynomial basis matrix (eq. 4-5 of Ding 2004).
-% Columns: odd orders k=1,3,...,K  ×  delays q=0,...,Q.
-% Row n:   [u(n)|u(n)|^0, u(n-1)|u(n-1)|^0, ..., u(n)|u(n)|^4, ...]
+% MP_BASIS  Build the memory-polynomial basis matrix.
+%
+%   Implements the basis of eq. (4) / eq. (5):
+%     column (k,q): u(n-q) · |u(n-q)|^{k-1}
+%
+%   k ∈ {1, 3, 5, …, K}  (odd orders only — bandpass PA convention)
+%   q ∈ {0, 1, …, Q}     (integer sample delays)
+%
+%   Returns Phi : N_u × [numel(odd_k)·(Q+1)]  complex matrix.
+
     N_u   = length(u);
     odd_k = 1:2:K;
     Phi   = zeros(N_u, numel(odd_k)*(Q+1), 'like', 1j);
     col   = 1;
     for k = odd_k
         for q = 0:Q
-            ud         = [zeros(q,1,'like',u); u(1:N_u-q)];
-            Phi(:,col) = ud .* abs(ud).^(k-1);
+            ud         = [zeros(q, 1, 'like', u); u(1:N_u-q)];  % delay by q
+            Phi(:,col) = ud .* abs(ud).^(k-1);                   % eq. (4)/(5)
             col        = col + 1;
         end
     end
